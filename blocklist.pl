@@ -8,7 +8,6 @@ use Fcntl ':flock';
 use File::Temp qw(tempfile);
 open my $self, '<', $0 or die "Couldn't open self: $!";
 flock $self, LOCK_EX | LOCK_NB or die "This script is already running";
-no if ($] >= 5.018), 'warnings' => 'experimental::smartmatch';
 ################################################################
 ###### Script to parse a Blocklist list. Block new IP     ######
 ###### and unblock deleted entrys                         ######
@@ -203,7 +202,7 @@ sub addIpsToBlocklist {
 \t\tflags interval
 \t\telements = {\n";
     foreach $line (uniq(@blackListArray)) {
-        if ((exists $ipsetArray{"$line"}) ||    ($line ~~ @whiteListArray)) {
+        if ((exists $ipsetArray{"$line"}) ||    ( grep { $_ eq $line } @whiteListArray)) {
             $skipped++;
         } else {
             if (is_ipv4($line) || is_ipv6($line)) {
@@ -223,7 +222,7 @@ sub addIpsToBlocklist {
         }
     }
     foreach $line (uniq(@fileArray)) {
-        if ((exists $ipsetArray{"$line"}) || ($line ~~ @whiteListArray)) {
+        if ((exists $ipsetArray{"$line"}) || (grep { $_ eq $line } @whiteListArray)) {
             $skipped++;
         } else {
             if (is_ipv4($line) || is_ipv6($line)) {
