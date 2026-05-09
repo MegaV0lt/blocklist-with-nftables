@@ -1,5 +1,5 @@
 NAME=blocklist
-VERSION=1.1.1
+VERSION=1.2.0
 
 SBIN_FILES=blocklist.pl
 ETC_FILES=blacklist whitelist
@@ -32,6 +32,7 @@ clean:
 all: $(PKG) $(SIG)
 
 test:
+	perl -c blocklist.pl
 
 tag:
 	git tag v$(VERSION)

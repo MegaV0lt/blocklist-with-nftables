@@ -5,18 +5,19 @@ Use at your own risk :)
 Tested on Debian Bookworm.
 
 ## What it does ##
-This script automatically downloads blocklist from sources you can define (in the blocklist.pl).
+This script automatically downloads blocklists from sources you can define in `blocklist.pl`.
 
-Then it will create two ipset lists. One for IPv4 IPs and one for IPv6 IPs.
+Then it will create nftables sets. One for IPv4 IPs and one for IPv6 IPs.
 
-It will then create an BLOCKLIST iptables/BLOCKLIST ip6tables chain which logs access attempts from blocked IPs (matched by the ipset lists), to your syslog and DROP the request. Also it will create an forward from your INPUT queue to the BLOCKLIST chain.
+It will then create nftables chains which log access attempts from blocked IPs to your syslog and DROP the request.
 
-Next time you run the script it will check if the IP is allready blocked or needs to be added. Also it will verify if the IP has been removed from your lists and remove it from the ipset as well. 
+Next time you run the script it rebuilds the managed nftables tables from the configured lists.
 
-This can be overruled by an white and blacklist you can define in the corresponding whitelist.xt and blacklist.
+This can be overruled by a white and blacklist you can define in the corresponding whitelist and blacklist files.
 
 Changes
 --------
+- V1.2.0: modernize Perl implementation, remove wget/rm shell calls, and use safer nft execution
 - V1.1.8: @pingou2712: add option to block nat instead and add files and script for systemd
 - V1.1.7: @pingou2712: Update README.md in order to include systemd
 - V1.1.6: @pingou2712: add option to block bridge instead
@@ -43,11 +44,9 @@ When upgrading from a version lower than 1.1.0 you might have to manually remove
 
 *Ignore error messages that might show up.*
 
-The script uses various binarys like iptables, ipset. If the script complains that it can't find an specific binary make sure it is in the ENV Path of the script. If not add the path to the ENV Variable.
+The script uses the `nft` binary. If the script complains that it can't find it, make sure it is in the environment `PATH`, or set the `NFT` environment variable to the full binary path.
 
-	$ENV{'PATH'}= '/bin:/usr/bin:/usr/local/bin:/sbin:/usr/sbin:/usr/local/sbin';
-
-(You can find out where your binarys are with "which" e.g. "which iptables")
+You can find the binary path with `which nft`.
 
 ## IP Blocking Strategies
 
@@ -65,9 +64,9 @@ Activating the -b flag, our IP blocking system addresses scenarios involving vir
 
 ## INSTALL ##
 
-1. Make sure you have ipset and the Data::Validate::IP Perl Module installed! If not you can usually install it with your distribution software management tool. E.g. apt for Debian/Ubuntu/Mint.
+1. Make sure you have Perl 5.32+ and nftables installed! If not you can usually install it with your distribution software management tool. E.g. apt for Debian/Ubuntu/Mint.
 
-		apt-get install ipset libdata-validate-ip-perl
+		apt-get install perl nftables
 
 2. Download the ZIP, or Clone the repository, to a folder on your system.
 
@@ -188,7 +187,7 @@ To use the bridge blocking option with systemd, modify `ExecStart` in `blocklist
 To use the nat blocking option with systemd, modify `ExecStart` in `blocklist.service` to include `-n`.
 
 ## CLEANUP ##
-If you want to remove the iptables rules and ipset lists just run
+If you want to remove the managed nftables tables just run
 
 	./blocklist.pl -c
 

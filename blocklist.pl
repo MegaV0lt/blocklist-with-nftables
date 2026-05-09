@@ -1,387 +1,304 @@
-#!/usr/bin/perl
-use strict; 
+#!/usr/bin/env perl
+use v5.32;
+use strict;
 use warnings;
-use FindBin '$Bin';
-use Data::Validate::IP qw(is_ipv4 is_ipv6);
-use Getopt::Std;
-use Fcntl ':flock';
+
+use Fcntl qw(:flock);
+use File::Spec;
 use File::Temp qw(tempfile);
-open my $self, '<', $0 or die "Couldn't open self: $!";
-flock $self, LOCK_EX | LOCK_NB or die "This script is already running";
+use Getopt::Long qw(GetOptions);
+use HTTP::Tiny;
+use Socket qw(AF_INET AF_INET6 inet_pton);
+
 ################################################################
-###### Script to parse a Blocklist list. Block new IP     ######
-###### and unblock deleted entrys                         ######
-###### Multiple list possible. IPV4 and IPV6 supported    ######
+###### Script to parse blocklists. Block new IPs and      ######
+###### remove deleted entries by rebuilding nftables sets. ######
+###### Multiple lists possible. IPv4 and IPv6 supported.   ######
 ################################################################
 
 ## config ##
-my @listUrl     = ("http://lists.blocklist.de/lists/all.txt");
-my $tmpDir      = "/tmp";
-my $logFile     = "/var/log/blocklist";
-my $whiteList   = "/etc/blocklist/whitelist";
-my $blackList   = "/etc/blocklist/blacklist";
+my @list_url   = ("http://lists.blocklist.de/lists/all.txt");
+my $log_file   = "/var/log/blocklist";
+my $white_list = "/etc/blocklist/whitelist";
+my $black_list = "/etc/blocklist/blacklist";
 
-## binarys ##
-## ! Notice ! Changing these values shouldn't be needed anymore
-## I'll leave it here just in case none of the paths below match.
-$ENV{'PATH'}    = '/bin:/usr/bin:/usr/local/bin:/sbin:/usr/sbin:/usr/local/sbin';
-my $nft         = "nft";
-my $grep        = "grep";
-my $rm          = "rm";
-my $wget        = "wget";
+## binaries ##
+$ENV{PATH} = '/bin:/usr/bin:/usr/local/bin:/sbin:/usr/sbin:/usr/local/sbin';
+my $nft = $ENV{NFT} // "nft";
 
-## plain variables ##
-my($row, $Blocklist, $line, $check, $checkLine, $result, $output, $url, $ipRegex, $message, %opt, $opt);
+my $table = "blocklist";
+my $mode  = "input";
 
-my ($added, $count, $removed, $skipped, $added_ipv4, $added_ipv6);
-$added = $count = $removed = $skipped = $added_ipv4 = $added_ipv6 = 0;
+my %stats = (
+    added      => 0,
+    removed    => 0,
+    skipped    => 0,
+    added_ipv4 => 0,
+    added_ipv6 => 0,
+);
 
-## init arrays ##
-my @fileArray = ();
-my @ipsetArray = ();
-my @whiteListArray = ();
-my @blackListArray = ();
-## init hashes for faster searching
-my %whiteListArray;
-my $blackListArray;
-my %ipsetArray;
-my %fileArray;
+open my $self, '<', $0 or die "Couldn't open self: $!";
+flock $self, LOCK_EX | LOCK_NB or die "This script is already running\n";
 
-my $dateTime;
-my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime();
-my @months = qw( Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec );
-my @days = qw(Sun Mon Tue Wed Thu Fri Sat Sun);
-
-my $TABLE = "blocklist";
-my $tmp_v4 = new File::Temp( UNLINK => 1);
-my $tmp_v6 = new File::Temp( UNLINK => 1);
-my $tmp_ipv4 = "";
-my $tmp_ipv6 = "";
-my $tmp_bridge_or_nat = new File::Temp( UNLINK => 1);
-my $bridge_nat_Option = 0;
-
-&init();
-
-############# init ##################
-#### check if we got any options ####
-#### and decide where to go      ####
-#####################################
+init();
 
 sub init {
-    $opt = 'hcbn';
-    getopts( "$opt", \%opt );
-    usage() if $opt{h};
-    cleanupAll() if $opt{c};
-    exit if $opt{c};
-    $bridge_nat_Option = 1 if $opt{b};
-    $bridge_nat_Option = 2 if $opt{n};
-    # else start main subroutine
+    my $help;
+    my $cleanup;
+    my $bridge;
+    my $nat;
+
+    GetOptions(
+        'h|help'    => \$help,
+        'c|cleanup' => \$cleanup,
+        'b|bridge'  => \$bridge,
+        'n|nat'     => \$nat,
+    ) or usage(1);
+
+    usage(0) if $help;
+    die "Options --bridge and --nat are mutually exclusive\n" if $bridge && $nat;
+
+    cleanup_all() if $cleanup;
+    exit 0 if $cleanup;
+
+    $mode = "bridge" if $bridge;
+    $mode = "nat"    if $nat;
+
     main();
 }
-############## end init #############
 
-############ usage ##################
-#### Some info about this script ####
-#####################################
-sub usage() {
-    print STDERR << "EOF";
-    blocklist-with-nftable
-    
-    This script downloads and parses Text files with IPs and blocks them. 
-    Just run ./blocklist.pl
-    
-    If you want to clean everything up run
-    ./blocklist.pl -c
+sub usage {
+    my ($exit_code) = @_;
+    print STDERR <<'EOF';
+blocklist-with-nftables
 
-    If you want block ip on bridge table run
-    ./blocklist.pl -b
+This script downloads and parses text files with IPs and blocks them.
+Just run ./blocklist.pl
 
-    If you want block ip on inet table prerouting to protect nat run
-    ./blocklist.pl -n
+If you want to clean everything up run:
+./blocklist.pl -c
+
+If you want to block IPs on the bridge table run:
+./blocklist.pl -b
+
+If you want to block IPs on inet table prerouting to protect NAT run:
+./blocklist.pl -n
 
 EOF
-    exit;
+    exit $exit_code;
 }
-#****************************#
-#*********** MAIN ***********#
-#****************************#
+
 sub main {
     logging("Starting blocklist refresh");
     logging("Removing Blocklist Tables");
-    &cleanupAll();
+    cleanup_all();
+
     logging("Generating Whitelist Array");
-    &getWhiteListArray();
+    my @whitelist = read_list_file($white_list);
+
     logging("Generating Blacklist Array");
-    &getBlackListArray();
+    my @blacklist = read_list_file($black_list);
+
     logging("Generating Blocklist Array");
-    &getFileArray();
+    my @blocklist = download_blocklists(@list_url);
+
     logging("Adding IPs to Blocklist");
-    &addIpsToBlocklist();
+    my ($ipv4, $ipv6) = collect_blocklist_entries(\@blocklist, \@blacklist, \@whitelist);
+
     logging("Adding Blocklist to ruleset");
-    &applyBlocklist();
+    apply_blocklist($ipv4, $ipv6);
+
     logging("Starting Cleanup");
-    &cleanup();
+    logging(
+        "We added $stats{added} (IPv4 = $stats{added_ipv4}, IPv6 = $stats{added_ipv6}), "
+        . "removed $stats{removed}, skipped $stats{skipped} Rules"
+    );
 
-    exit;
+    exit 0;
 }
-#***** END MAIN *****#
 
+sub read_list_file {
+    my ($path) = @_;
+    open my $fh, '<', $path or die "Could not open $path: $!";
+    chomp(my @lines = <$fh>);
+    return @lines;
+}
 
-#****************************#
-#******* Subroutines ********#
-#****************************#
+sub download_blocklists {
+    my (@urls) = @_;
+    my $http = HTTP::Tiny->new(timeout => 60);
+    my @entries;
 
-########## getFileArray #############
-## downloads the Blocklist.txt and ##
-## pushes it into an array         ##
-#####################################
-sub getFileArray {
-    foreach $url (@listUrl) {
-        $count++;
-        `$wget -q -O $tmpDir/Blocklist_$count $url && echo "Downloaded temp file to $tmpDir/Blocklist_$count" || echo "Can not download file.... stopping"`;
+    for my $url (@urls) {
+        my $response = $http->get($url);
+        die "Can not download $url: $response->{status} $response->{reason}\n"
+            unless $response->{success};
 
-        open(INFO, "$tmpDir/Blocklist_$count") or die("Could not open file.");
-        foreach $line (<INFO>) {
-            push(@fileArray, $line);
+        push @entries, split /\R/, $response->{content};
+        print "Downloaded blocklist from $url\n";
+    }
+
+    return @entries;
+}
+
+sub collect_blocklist_entries {
+    my ($blocklist, $blacklist, $whitelist) = @_;
+    my %whitelist = map { $_ => 1 } @$whitelist;
+    my @ipv4;
+    my @ipv6;
+
+    for my $line (uniq(@$blacklist, @$blocklist)) {
+        if ($whitelist{$line}) {
+            $stats{skipped}++;
+            next;
         }
 
-        close(INFO);
-    }
-    chomp(@fileArray);
-    %fileArray = map {$_ => 1 } @fileArray;
-}
-####### END getFileArray ##########
-
-######### getWhiteListArray ######
-## puts all ips from our        ##
-## $whitelist into              ##
-## array whiteListArray         ##
-##################################
-
-sub getWhiteListArray {
-    open(INFO, $whiteList) or die("Could not open Whitelist.");
-    foreach $line (<INFO>) {
-        push(@whiteListArray, $line);
-    }
-
-    close(INFO);
-    chomp(@whiteListArray);
-}
-##### END getWhiteListArray #####
-
-######### getBlackListArray ######
-## puts all ips from our        ##
-## $whitelist into              ##
-## array blackListArray         ##
-##################################
-
-sub getBlackListArray {
-    open(INFO, $blackList) or die("Could not open Blacklist.");
-    foreach $line (<INFO>) {
-        push(@blackListArray, $line);
-    }
-
-    close(INFO);
-    chomp(@blackListArray);
-}
-##### END getBlackListArray #####
-
-######## addIpsToBlocklist ######
-## adds IPs to our blocklist   ##
-#################################
-
-sub addIpsToBlocklist {
-
-    #Prepare ipv4 and ipv6 set
-    $tmp_ipv4 = "\tset ipv4 {
-\t\ttype ipv4_addr
-\t\tflags interval
-\t\telements = {\n";
-    $tmp_ipv6 = "\tset ipv6 {
-\t\ttype ipv6_addr
-\t\tflags interval
-\t\telements = {\n";
-    foreach $line (uniq(@blackListArray)) {
-        if ((exists $ipsetArray{"$line"}) ||    ( grep { $_ eq $line } @whiteListArray)) {
-            $skipped++;
+        if (is_ipv4($line)) {
+            push @ipv4, $line;
+            $stats{added}++;
+            $stats{added_ipv4}++;
+        } elsif (is_ipv6($line)) {
+            push @ipv6, $line;
+            $stats{added}++;
+            $stats{added_ipv6}++;
         } else {
-            if (is_ipv4($line) || is_ipv6($line)) {
-                if(is_ipv4($line)) {
-			$tmp_ipv4 = "${tmp_ipv4}\t\t\t$line,\n";
-			$added_ipv4++;
-                } else {
-			$tmp_ipv6 = "${tmp_ipv6}\t\t\t$line,\n";
-			$added_ipv6++;
-                }
-                $added++;
-		#$message = "added $line";
-		#logging($message);
-            } else {
-                $skipped++;
-            }
+            $stats{skipped}++;
         }
     }
-    foreach $line (uniq(@fileArray)) {
-        if ((exists $ipsetArray{"$line"}) || (grep { $_ eq $line } @whiteListArray)) {
-            $skipped++;
-        } else {
-            if (is_ipv4($line) || is_ipv6($line)) {
-                if(is_ipv4($line)) {
-			$tmp_ipv4 = "${tmp_ipv4}\t\t\t$line,\n";
-			$added_ipv4++;
-                } else {
-			$tmp_ipv6 = "${tmp_ipv6}\t\t\t$line,\n";
-			$added_ipv6++;
-                }
-                $added++;
-		#$message = "added $line";
-		#logging($message);
-            } else {
-                $skipped++;
-            }
-        } 
-    } 
-    $tmp_ipv4 = "${tmp_ipv4}\t\t}
-\t}\n";
-    $tmp_ipv6 = "${tmp_ipv6}\t\t}
-\t}\n";
 
-    # Build tmp_v4 and v4 OR tmp_bridge
-    if ( $bridge_nat_Option == 0 )
-    {
-        print $tmp_v4 "table ip $TABLE {\n";
-	print $tmp_v4 "$tmp_ipv4";
-        print $tmp_v4 "\tchain input {
-\t\ttype filter hook input priority 100; policy accept;
-\t\tip saddr \@ipv4 log prefix \"Blocklist Dropped: \" drop
-\t}
-}\n";
-
-        print $tmp_v6 "table ip6 $TABLE {\n";
-	print $tmp_v6 "$tmp_ipv6";
-        print $tmp_v6 "\tchain input {
-\t\ttype filter hook input priority 100; policy accept;
-\t\tip6 saddr \@ipv6 log prefix \"Blocklist Dropped: \" drop
-\t}
-}\n";
-
-    } elsif ( $bridge_nat_Option == 1 ) {
-        print $tmp_bridge_or_nat "table bridge $TABLE {\n";
-	print $tmp_bridge_or_nat "$tmp_ipv4";
-	print $tmp_bridge_or_nat "$tmp_ipv6";
-        print $tmp_bridge_or_nat "\tchain prerouting {
-\t\ttype filter hook prerouting priority 100; policy accept;
-\t\tip saddr \@ipv4 log prefix \"Blocklist Bridge Dropped: \" drop
-\t\tip6 saddr \@ipv6 log prefix \"Blocklist Bridge Dropped: \" drop
-\t}
-}\n";
-    } else {
-        print $tmp_bridge_or_nat "table inet $TABLE {\n";
-	print $tmp_bridge_or_nat "$tmp_ipv4";
-	print $tmp_bridge_or_nat "$tmp_ipv6";
-        print $tmp_bridge_or_nat "\tchain prerouting {
-\t\ttype filter hook prerouting priority 100; policy accept;
-\t\tip saddr \@ipv4 log prefix \"Blocklist Prerouting Dropped: \" drop
-\t\tip6 saddr \@ipv6 log prefix \"Blocklist Prerouting Dropped: \" drop
-\t}
-}\n";
-    }
+    return (\@ipv4, \@ipv6);
 }
-######## END addIpsToBlocklist ######
 
-################## applyBlocklist ###################
-####          Apply temp NFtable files          #####
-#####################################################
-sub applyBlocklist {
-    if ( $bridge_nat_Option == 0 )
-    {
-        if ( $added_ipv4 > 0)
-        {
-	    `$nft -f $tmp_v4`;
-            $message = "Added Blocklist for IPv4 to ruleset";
-            logging($message);
+sub is_ipv4 {
+    my ($value) = @_;
+    return defined inet_pton(AF_INET, $value);
+}
+
+sub is_ipv6 {
+    my ($value) = @_;
+    return defined inet_pton(AF_INET6, $value);
+}
+
+sub render_set {
+    my ($name, $type, $entries) = @_;
+    my $rules = "\tset $name {\n"
+        . "\t\ttype $type\n"
+        . "\t\tflags interval\n"
+        . "\t\telements = {\n";
+
+    $rules .= join "", map { "\t\t\t$_,\n" } @$entries;
+    $rules .= "\t\t}\n\t}\n";
+    return $rules;
+}
+
+sub input_ruleset {
+    my ($family, $set_name, $set_type, $field, $entries) = @_;
+    return "table $family $table {\n"
+        . render_set($set_name, $set_type, $entries)
+        . "\tchain input {\n"
+        . "\t\ttype filter hook input priority filter; policy accept;\n"
+        . "\t\t$field \@$set_name log prefix \"Blocklist Dropped: \" drop\n"
+        . "\t}\n"
+        . "}\n";
+}
+
+sub bridge_or_nat_ruleset {
+    my ($family, $prefix, $ipv4, $ipv6) = @_;
+    return "table $family $table {\n"
+        . render_set("ipv4", "ipv4_addr", $ipv4)
+        . render_set("ipv6", "ipv6_addr", $ipv6)
+        . "\tchain prerouting {\n"
+        . "\t\ttype filter hook prerouting priority filter; policy accept;\n"
+        . "\t\tip saddr \@ipv4 log prefix \"$prefix\" drop\n"
+        . "\t\tip6 saddr \@ipv6 log prefix \"$prefix\" drop\n"
+        . "\t}\n"
+        . "}\n";
+}
+
+sub apply_blocklist {
+    my ($ipv4, $ipv6) = @_;
+
+    if ($mode eq "input") {
+        if (@$ipv4) {
+            apply_ruleset(input_ruleset("ip", "ipv4", "ipv4_addr", "ip saddr", $ipv4));
+            logging("Added Blocklist for IPv4 to ruleset");
         }
-        if ( $added_ipv6 > 0)
-        {
-	    `$nft -f $tmp_v6`;
-            $message = "Added Blocklist for IPv6 to ruleset";
-            logging($message);
+        if (@$ipv6) {
+            apply_ruleset(input_ruleset("ip6", "ipv6", "ipv6_addr", "ip6 saddr", $ipv6));
+            logging("Added Blocklist for IPv6 to ruleset");
         }
-    } else {
-        if ( $added_ipv4 + $added_ipv6 > 0)
-        {
-	    `$nft -f $tmp_bridge_or_nat`;
-            $message = "Added Bridge or NAT Blocklist for IPv4/IPv6 to ruleset";
-            logging($message);
-	}
+        return;
     }
+
+    return unless @$ipv4 || @$ipv6;
+
+    my $family = $mode eq "bridge" ? "bridge" : "inet";
+    my $prefix = $mode eq "bridge"
+        ? "Blocklist Bridge Dropped: "
+        : "Blocklist Prerouting Dropped: ";
+
+    apply_ruleset(bridge_or_nat_ruleset($family, $prefix, $ipv4, $ipv6));
+    logging("Added Bridge or NAT Blocklist for IPv4/IPv6 to ruleset");
 }
-############### END applyBlocklist ######################
 
-################## cleanup ###################
-#### Cleanup: move tmp file to new place #####
-##############################################
-sub cleanup {
-    for (1..$count) {
-        $result = `$rm $tmpDir/Blocklist_$_ && echo "Deleted file $tmpDir/Blocklist_$_" || echo "Can\t delete file $tmpDir/Blocklist_$_"`;
-    }
-    $message = "We added $added (IPv4 = $added_ipv4, IPv6 = $added_ipv6), removed $removed, skipped $skipped Rules";
-    logging($message);
+sub apply_ruleset {
+    my ($ruleset) = @_;
+    my ($fh, $filename) = tempfile();
+    print {$fh} $ruleset;
+    close $fh or die "Could not close temp ruleset $filename: $!";
+    run_nft("-f", $filename);
+    unlink $filename or warn "Could not delete temp ruleset $filename: $!";
 }
-############### END cleanup ######################
 
-########### cleanupAll #################
-#### Remove our Rules from nftables ####
-#### and flush our ipset lists      ####
-########################################
-
-sub cleanupAll {
-    my $returnCode;
-    $returnCode = system("$nft list table ip blocklist > /dev/null 2> /dev/null");
-    if ( $returnCode == 0 ) {
-	`$nft delete table ip blocklist`;
-    }
-    $returnCode = system("$nft list table ip6 blocklist > /dev/null 2> /dev/null");
-    if ( $returnCode == 0 ) {
-	`$nft delete table ip6 blocklist`;
-    }
-    $returnCode = system("$nft list table bridge blocklist > /dev/null 2> /dev/null");
-    if ( $returnCode == 0 ) {
-	`$nft delete table bridge blocklist`;
-    }
-    $returnCode = system("$nft list table inet blocklist > /dev/null 2> /dev/null");
-    if ( $returnCode == 0 ) {
-	`$nft delete table inet blocklist`;
+sub cleanup_all {
+    for my $family (qw(ip ip6 bridge inet)) {
+        next unless nft_table_exists($family);
+        run_nft("delete", "table", $family, $table);
     }
 }
 
-########################################
+sub nft_table_exists {
+    my ($family) = @_;
+    return run_command_quiet($nft, "list", "table", $family, $table);
+}
 
-###### log #######
-## log $message ##
-##################
+sub run_nft {
+    my (@args) = @_;
+    system($nft, @args) == 0
+        or die "nft @args failed with exit code " . ($? >> 8) . "\n";
+}
+
+sub run_command_quiet {
+    my (@command) = @_;
+
+    my $pid = fork();
+    die "Could not fork for @command: $!" unless defined $pid;
+
+    if ($pid == 0) {
+        open STDOUT, '>', File::Spec->devnull
+            or die "Could not redirect STDOUT to null device: $!";
+        open STDERR, '>', File::Spec->devnull
+            or die "Could not redirect STDERR to null device: $!";
+        exec @command;
+        exit 127;
+    }
+
+    waitpid $pid, 0;
+    return $? == 0;
+}
+
 sub logging {
     my ($message) = @_;
+    my ($sec, $min, $hour, $mday, $mon) = localtime();
+    my @months = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    my $date_time = sprintf("%s  %02d %02d:%02d:%02d", $months[$mon], $mday, $hour, $min, $sec);
 
-    ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime();
-
-    open my $fh, ">>", $logFile
-        or die "Can't open logfile: $!";
-    $dateTime = sprintf("$months[$mon]  %02d %02d:%02d:%02d ", $mday,$hour,$min,$sec);
-    print $fh "$dateTime $message\n";
+    open my $fh, '>>', $log_file or die "Can't open logfile $log_file: $!";
+    print {$fh} "$date_time $message\n";
     print "$message\n";
-
-    close($fh);
 }
-#### end log #####
 
-############## uniq ###############
-## Make sure we wont             ##
-## add/remove the same ip twice  ##
-###################################
-
-sub uniq { my %seen; grep !$seen{$_}++, @_ } # from http://stackoverflow.com/questions/13257095/remove-duplicate-values-for-a-key-in-hash
-
-#### end uniq ####
-
-######### EOF ###########
+sub uniq {
+    my %seen;
+    return grep { !$seen{$_}++ } @_;
+}
