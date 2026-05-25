@@ -22,6 +22,7 @@ my @list_url;
 my $log_file;
 my $white_list;
 my $black_list;
+my $version = '1.2.1';
 
 ## binaries ##
 $ENV{PATH} = '/bin:/usr/bin:/usr/local/bin:/sbin:/usr/sbin:/usr/local/sbin';
@@ -92,7 +93,8 @@ sub init {
     ensure_log_file_exists();
     ensure_list_files_exist();
 
-    # print the config for debugging
+    # print the version and config for debugging
+    print "blocklist-with-nftables version $version\n";
     print "Using the following configuration:\n";
     print "List URLs:\n";
     print "  - $_\n" for @list_url;

@@ -17,6 +17,7 @@ This can be overruled by a white and blacklist you can define in the correspondi
 
 Changes
 --------
+- V1.2.1: move configuration values to external `config.pl` and document external config usage
 - V1.2.0: modernize Perl implementation, remove wget/rm shell calls, and use safer nft execution
 - V1.1.8: @pingou2712: add option to block nat instead and add files and script for systemd
 - V1.1.7: @pingou2712: Update README.md in order to include systemd
@@ -70,13 +71,19 @@ Activating the -b flag, our IP blocking system addresses scenarios involving vir
 
 2. Download the ZIP, or Clone the repository, to a folder on your system.
 
-3. Open blocklist.pl with your favorite text editor and set up your blocklist urls. Two are included as default. You can enhance or edit as you like. The destination URL should be an direct link to an Text file though.
+3. Open `config.pl` with your favorite text editor and set up your blocklist URLs, log file path, whitelist path, and blacklist path. The script now loads these values from this external config file instead of hardcoding them in `blocklist.pl`.
 
-        my @listUrl = ("http://lists.blocklist.de/lists/all.txt", "http://www.infiltrated.net/blacklisted");
+        our %CONFIG = (
+            list_url   => [
+                "http://lists.blocklist.de/lists/all.txt",
+                "https://www.spamhaus.org/drop/drop.txt",
+            ],
+            log_file   => "/var/log/blocklist",
+            white_list => "/etc/blocklist/whitelist",
+            black_list => "/etc/blocklist/blacklist",
+        );
 
-        *You can for example add an list like this*
-
-        my @listUrl = ("http://lists.blocklist.de/lists/all.txt", "http://www.infiltrated.net/blacklisted", "http://www.superblocksite.org/anotherBlocklist.txt");
+        *You can add more URLs to the `list_url` array if you want to use additional blocklists.*
 
 4. Schedule the script execution using either a cron job or systemd (see below).
 
