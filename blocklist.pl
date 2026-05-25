@@ -5,22 +5,23 @@ use warnings;
 
 use Fcntl qw(:flock);
 use File::Spec;
+use File::Path qw(make_path);
 use File::Temp qw(tempfile);
 use Getopt::Long qw(GetOptions);
 use HTTP::Tiny;
 use Socket qw(AF_INET AF_INET6 inet_pton);
 
-################################################################
-###### Script to parse blocklists. Block new IPs and      ######
+#################################################################
+###### Script to parse blocklists. Block new IPs and       ######
 ###### remove deleted entries by rebuilding nftables sets. ######
 ###### Multiple lists possible. IPv4 and IPv6 supported.   ######
-################################################################
+#################################################################
 
 ## config ##
-my @list_url   = ("http://lists.blocklist.de/lists/all.txt");
-my $log_file   = "/var/log/blocklist";
-my $white_list = "/etc/blocklist/whitelist";
-my $black_list = "/etc/blocklist/blacklist";
+my @list_url;
+my $log_file;
+my $white_list;
+my $black_list;
 
 ## binaries ##
 $ENV{PATH} = '/bin:/usr/bin:/usr/local/bin:/sbin:/usr/sbin:/usr/local/sbin';
@@ -63,8 +64,65 @@ sub init {
 
     $mode = "bridge" if $bridge;
     $mode = "nat"    if $nat;
+ 
+    # read the config file which should be in the same directory as the script
+    my ($volume, $directories, $script_name) = File::Spec->splitpath(File::Spec->rel2abs(__FILE__));
+    my $config_file = File::Spec->catfile($directories, 'config.pl');
+
+    if (-e $config_file) {
+        my $load_result = do $config_file;
+        die "Error loading config file: $config_file: $@" if $@;
+        die "Could not load config file: $config_file" unless defined $load_result;
+
+        no warnings 'once';
+        my %config = %main::CONFIG;
+        use warnings;
+        if (!exists $config{'list_url'} || !exists $config{'log_file'} || !exists $config{'white_list'} || !exists $config{'black_list'}) {
+            die "Invalid config file: missing required configuration keys";
+        }
+
+        @list_url   = @{ $config{'list_url'} };
+        $log_file   = $config{'log_file'};
+        $white_list = $config{'white_list'};
+        $black_list = $config{'black_list'};
+    } else {
+        die "Config file not found: $config_file";
+    }
+
+    ensure_log_file_exists();
+    ensure_list_files_exist();
+
+    # print the config for debugging
+    print "Using the following configuration:\n";
+    print "List URLs:\n";
+    print "  - $_\n" for @list_url;
+    print "Log file: $log_file\n";
+    print "Whitelist file: $white_list\n";
+    print "Blacklist file: $black_list\n";  
 
     main();
+}
+
+sub ensure_log_file_exists {
+    return unless defined $log_file && length $log_file;
+
+    my ($volume, $directories, $filename) = File::Spec->splitpath($log_file);
+    if ($directories && !-d $directories) {
+        make_path($directories) or die "Could not create log directory $directories: $!";
+    }
+
+    unless (-e $log_file) {
+        open my $fh, '>>', $log_file or die "Could not create log file $log_file: $!";
+        close $fh or die "Could not close log file $log_file: $!";
+    }
+}
+
+sub ensure_list_files_exist {
+    for my $path ($white_list, $black_list) {
+        die "Missing required file: $path\n" unless defined $path && length $path;
+        die "Required file not found: $path\n" unless -e $path;
+        die "Required file is not readable: $path\n" unless -r $path;
+    }
 }
 
 sub usage {
