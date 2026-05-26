@@ -354,11 +354,14 @@ sub normalize_entries {
         push @kept, $c;
     }
 
-    # produce final cidr list: keep original cidr strings for non-skipped entries
-    my @final_cidrs = map { $_->{cidr} } grep { !$_->{skip} } @cidr_structs;
-
-    # prepare sorted kept ranges for single lookup
-    my @kept_ranges = map { { start => $_->{start}, end => $_->{end} } } grep { !$_->{skip} } @cidr_structs;
+    # produce final cidr list by converting merged/kept ranges into minimal CIDRs
+    my @final_cidrs;
+    my @kept_ranges;
+    for my $k (@kept) {
+        next if $k->{skip};
+        push @kept_ranges, { start => $k->{start}, end => $k->{end} };
+        push @final_cidrs, range_to_cidrs($k->{start}, $k->{end});
+    }
 
     # remove singles that fall into any remaining cidr using binary search
     my @final_singles;
