@@ -203,7 +203,7 @@ sub read_list_file {
         $line =~ s/^\s+|\s+$//g;
         next if $line eq '';
         $line =~ s/^\s*#.*$//;    # skip full-line comments
-        $line =~ s/\s*#.*$//;     # strip inline comments
+        $line =~ s/\s*[#;].*$//;  # strip inline comments
         $line =~ s/^\s+|\s+$//g;
         next if $line eq '';
         push @lines, $line;
