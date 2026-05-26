@@ -83,9 +83,9 @@ sub init {
     while (my $line = <$cfg>) {
         chomp $line;
         $line =~ s/^\s+|\s+$//g;
-        next if $line eq '';
-        next if $line =~ /^\s*#/;
-        $line =~ s/\s*#.*$//;    # strip inline comments
+            next if $line eq '';
+            next if $line =~ /^\s*[#;]/;
+            $line =~ s/\s*[#;].*$//;    # strip inline comments (# or ;)
         next if $line =~ /^\s*$/;
         if ($line =~ /^([^=\s]+)\s*=\s*(.+)$/) {
             my ($k, $v) = ($1, $2);
@@ -202,8 +202,8 @@ sub read_list_file {
         chomp $line;
         $line =~ s/^\s+|\s+$//g;
         next if $line eq '';
-        $line =~ s/^\s*#.*$//;    # skip full-line comments
-        $line =~ s/\s*#.*$//;     # strip inline comments
+        next if $line =~ /^\s*[#;]/;   # skip full-line comments starting with # or ;
+        $line =~ s/\s*[#;].*$//;        # strip inline comments (# or ;)
         $line =~ s/^\s+|\s+$//g;
         next if $line eq '';
         push @lines, $line;
@@ -224,8 +224,8 @@ sub download_blocklists {
         for my $line (split /\R/, $response->{content}) {
             $line =~ s/^\s+|\s+$//g;
             next if $line eq '';
-            $line =~ s/^\s*#.*$//;    # skip commented lines
-            $line =~ s/\s*#.*$//;     # strip inline comments
+            next if $line =~ /^\s*[#;]/;   # skip commented lines starting with # or ;
+            $line =~ s/\s*[#;].*$//;        # strip inline comments (# or ;)
             $line =~ s/^\s+|\s+$//g;
             next if $line eq '';
             push @entries, $line;
