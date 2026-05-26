@@ -9,7 +9,8 @@ use File::Path qw(make_path);
 use File::Temp qw(tempfile);
 use Getopt::Long qw(GetOptions);
 use HTTP::Tiny;
-use Socket qw(AF_INET AF_INET6 inet_pton);
+use Socket qw(AF_INET AF_INET6 inet_pton inet_ntop);
+use Math::BigInt;
 
 #################################################################
 ###### Script to parse blocklists. Block new IPs and       ######
@@ -451,6 +452,63 @@ sub lower_bound_ranges {
         if ($arr_ref->[$mid]{start} lt $target) { $lo = $mid + 1 } else { $hi = $mid }
     }
     return $lo;
+}
+
+sub packed_to_bigint {
+    my ($packed) = @_;
+    return unless defined $packed;
+    my $hex = unpack('H*', $packed);
+    return Math::BigInt->from_hex('0x' . $hex);
+}
+
+sub bigint_to_packed {
+    my ($bi, $len) = @_;
+    return unless defined $bi;
+    my $hex = $bi->as_hex(); # '0x...'
+    $hex =~ s/^0x//i;
+    $hex = '0' . $hex unless length $hex % 2 == 0;
+    my $need = $len * 2;
+    $hex = ('0' x ($need - length($hex))) . $hex if length($hex) < $need;
+    return pack('H*', $hex);
+}
+
+sub range_to_cidrs {
+    my ($start_packed, $end_packed) = @_;
+    my $len = length $start_packed;
+    my $maxbits = $len * 8;
+    my $start_bi = packed_to_bigint($start_packed);
+    my $end_bi = packed_to_bigint($end_packed);
+    my @cidrs;
+
+    while ($start_bi <= $end_bi) {
+        # find largest block aligned at start
+        my $max_pref = 0;
+        for (my $pref = 0; $pref <= $maxbits; $pref++) {
+            my $block = Math::BigInt->new(2)->bpow($maxbits - $pref);
+            # alignment check: start_bi % block == 0
+            my $mod = $start_bi->copy()->bmod($block);
+            last if $mod != 0;
+            $max_pref = $pref;
+        }
+        # adjust prefix so block does not exceed end
+        while (1) {
+            my $block = Math::BigInt->new(2)->bpow($maxbits - $max_pref);
+            my $block_end = $start_bi->copy()->badd($block)->bdec();
+            last if $block_end <= $end_bi;
+            $max_pref++;
+        }
+
+        # produce cidr for start_bi with prefix max_pref
+        my $packed = bigint_to_packed($start_bi, $len);
+        my $ip_text = inet_ntop($len == 4 ? AF_INET : AF_INET6, $packed);
+        push @cidrs, "$ip_text/$max_pref";
+
+        # advance start_bi by block size
+        my $advance = Math::BigInt->new(2)->bpow($maxbits - $max_pref);
+        $start_bi = $start_bi->copy()->badd($advance);
+    }
+
+    return @cidrs;
 }
 
 sub is_ipv4 {
