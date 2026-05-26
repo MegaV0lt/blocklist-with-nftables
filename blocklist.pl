@@ -5,22 +5,24 @@ use warnings;
 
 use Fcntl qw(:flock);
 use File::Spec;
+use File::Path qw(make_path);
 use File::Temp qw(tempfile);
 use Getopt::Long qw(GetOptions);
 use HTTP::Tiny;
 use Socket qw(AF_INET AF_INET6 inet_pton);
 
-################################################################
-###### Script to parse blocklists. Block new IPs and      ######
+#################################################################
+###### Script to parse blocklists. Block new IPs and       ######
 ###### remove deleted entries by rebuilding nftables sets. ######
 ###### Multiple lists possible. IPv4 and IPv6 supported.   ######
-################################################################
+#################################################################
 
 ## config ##
-my @list_url   = ("http://lists.blocklist.de/lists/all.txt");
-my $log_file   = "/var/log/blocklist";
-my $white_list = "/etc/blocklist/whitelist";
-my $black_list = "/etc/blocklist/blacklist";
+my @list_url;
+my $log_file;
+my $white_list;
+my $black_list;
+my $version = '1.2.1';
 
 ## binaries ##
 $ENV{PATH} = '/bin:/usr/bin:/usr/local/bin:/sbin:/usr/sbin:/usr/local/sbin';
@@ -64,7 +66,82 @@ sub init {
     $mode = "bridge" if $bridge;
     $mode = "nat"    if $nat;
 
+    # determine the config file path
+    my ($volume, $directories, $script_name) = File::Spec->splitpath(File::Spec->rel2abs(__FILE__));
+    my $default_config = File::Spec->catfile($directories, 'blocklist.conf');
+    my $installed_config = '/etc/blocklist/blocklist.conf';
+    my $config_file = $ENV{BLOCKLIST_CONFIG} // $default_config;
+
+    unless (-e $config_file) {
+        $config_file = $installed_config if -e $installed_config;
+    }
+
+    die "Config file not found: $config_file" unless -e $config_file;
+
+    my %c;
+    open my $cfg, '<', $config_file or die "Could not open config file $config_file: $!";
+    while (my $line = <$cfg>) {
+        chomp $line;
+        $line =~ s/^\s+|\s+$//g;
+        next if $line eq '';
+        next if $line =~ /^\s*#/;
+        $line =~ s/\s*#.*$//;    # strip inline comments
+        next if $line =~ /^\s*$/;
+        if ($line =~ /^([^=\s]+)\s*=\s*(.+)$/) {
+            my ($k, $v) = ($1, $2);
+            if ($k eq 'list_url') {
+                push @{ $c{list_url} }, $v;
+            } else {
+                $c{$k} = $v;
+            }
+        }
+    }
+    close $cfg;
+
+    if (!exists $c{list_url} || !exists $c{log_file} || !exists $c{white_list} || !exists $c{black_list}) {
+        die "Invalid config file: missing required configuration keys";
+    }
+
+    @list_url   = @{ $c{list_url} };
+    $log_file   = $c{log_file};
+    $white_list = $c{white_list};
+    $black_list = $c{black_list};
+
+    ensure_log_file_exists();
+    ensure_list_files_exist();
+
+    # print the version and config for debugging
+    print "blocklist-with-nftables version $version\n";
+    print "Using the following configuration:\n";
+    print "List URLs:\n";
+    print "  - $_\n" for @list_url;
+    print "Log file: $log_file\n";
+    print "Whitelist file: $white_list\n";
+    print "Blacklist file: $black_list\n";
+
     main();
+}
+
+sub ensure_log_file_exists {
+    return unless defined $log_file && length $log_file;
+
+    my ($volume, $directories, $filename) = File::Spec->splitpath($log_file);
+    if ($directories && !-d $directories) {
+        make_path($directories) or die "Could not create log directory $directories: $!";
+    }
+
+    unless (-e $log_file) {
+        open my $fh, '>>', $log_file or die "Could not create log file $log_file: $!";
+        close $fh or die "Could not close log file $log_file: $!";
+    }
+}
+
+sub ensure_list_files_exist {
+    for my $path ($white_list, $black_list) {
+        die "Missing required file: $path\n" unless defined $path && length $path;
+        die "Required file not found: $path\n" unless -e $path;
+        die "Required file is not readable: $path\n" unless -r $path;
+    }
 }
 
 sub usage {
@@ -120,7 +197,17 @@ sub main {
 sub read_list_file {
     my ($path) = @_;
     open my $fh, '<', $path or die "Could not open $path: $!";
-    chomp(my @lines = <$fh>);
+    my @lines;
+    while (my $line = <$fh>) {
+        chomp $line;
+        $line =~ s/^\s+|\s+$//g;
+        next if $line eq '';
+        $line =~ s/^\s*#.*$//;    # skip full-line comments
+        $line =~ s/\s*#.*$//;     # strip inline comments
+        $line =~ s/^\s+|\s+$//g;
+        next if $line eq '';
+        push @lines, $line;
+    }
     return @lines;
 }
 
@@ -134,7 +221,15 @@ sub download_blocklists {
         die "Can not download $url: $response->{status} $response->{reason}\n"
             unless $response->{success};
 
-        push @entries, split /\R/, $response->{content};
+        for my $line (split /\R/, $response->{content}) {
+            $line =~ s/^\s+|\s+$//g;
+            next if $line eq '';
+            $line =~ s/^\s*#.*$//;    # skip commented lines
+            $line =~ s/\s*#.*$//;     # strip inline comments
+            $line =~ s/^\s+|\s+$//g;
+            next if $line eq '';
+            push @entries, $line;
+        }
         print "Downloaded blocklist from $url\n";
     }
 
@@ -148,6 +243,11 @@ sub collect_blocklist_entries {
     my @ipv6;
 
     for my $line (uniq(@$blacklist, @$blocklist)) {
+        next unless defined $line;
+        $line =~ s/^\s+|\s+$//g;
+        # skip empty or commented
+        next if $line eq '';
+
         if ($whitelist{$line}) {
             $stats{skipped}++;
             next;
@@ -171,11 +271,19 @@ sub collect_blocklist_entries {
 
 sub is_ipv4 {
     my ($value) = @_;
+    return 0 unless defined $value && length $value;
+    if ($value =~ m{^([^/]+)/(\d+)$}) {
+        $value = $1;
+    }
     return defined inet_pton(AF_INET, $value);
 }
 
 sub is_ipv6 {
     my ($value) = @_;
+    return 0 unless defined $value && length $value;
+    if ($value =~ m{^([^/]+)/(\d+)$}) {
+        $value = $1;
+    }
     return defined inet_pton(AF_INET6, $value);
 }
 

@@ -1,8 +1,8 @@
 NAME=blocklist
-VERSION=1.2.0
+VERSION=1.2.1
 
 SBIN_FILES=blocklist.pl
-ETC_FILES=blacklist whitelist
+ETC_FILES=blocklist.conf blacklist whitelist
 
 PKG_DIR=pkg
 PKG_NAME=$(NAME)-$(VERSION)
