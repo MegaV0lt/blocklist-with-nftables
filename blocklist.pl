@@ -65,30 +65,47 @@ sub init {
 
     $mode = "bridge" if $bridge;
     $mode = "nat"    if $nat;
- 
-    # read the config file which should be in the same directory as the script
+
+    # determine the config file path
     my ($volume, $directories, $script_name) = File::Spec->splitpath(File::Spec->rel2abs(__FILE__));
-    my $config_file = File::Spec->catfile($directories, 'config.pl');
+    my $default_config = File::Spec->catfile($directories, 'blocklist.conf');
+    my $installed_config = '/etc/blocklist/blocklist.conf';
+    my $config_file = $ENV{BLOCKLIST_CONFIG} // $default_config;
 
-    if (-e $config_file) {
-        my $load_result = do $config_file;
-        die "Error loading config file: $config_file: $@" if $@;
-        die "Could not load config file: $config_file" unless defined $load_result;
-
-        no warnings 'once';
-        my %config = %main::CONFIG;
-        use warnings;
-        if (!exists $config{'list_url'} || !exists $config{'log_file'} || !exists $config{'white_list'} || !exists $config{'black_list'}) {
-            die "Invalid config file: missing required configuration keys";
-        }
-
-        @list_url   = @{ $config{'list_url'} };
-        $log_file   = $config{'log_file'};
-        $white_list = $config{'white_list'};
-        $black_list = $config{'black_list'};
-    } else {
-        die "Config file not found: $config_file";
+    unless (-e $config_file) {
+        $config_file = $installed_config if -e $installed_config;
     }
+
+    die "Config file not found: $config_file" unless -e $config_file;
+
+    my %c;
+    open my $cfg, '<', $config_file or die "Could not open config file $config_file: $!";
+    while (my $line = <$cfg>) {
+        chomp $line;
+        $line =~ s/^\s+|\s+$//g;
+        next if $line eq '';
+        next if $line =~ /^\s*#/;
+        $line =~ s/\s*#.*$//;    # strip inline comments
+        next if $line =~ /^\s*$/;
+        if ($line =~ /^([^=\s]+)\s*=\s*(.+)$/) {
+            my ($k, $v) = ($1, $2);
+            if ($k eq 'list_url') {
+                push @{ $c{list_url} }, $v;
+            } else {
+                $c{$k} = $v;
+            }
+        }
+    }
+    close $cfg;
+
+    if (!exists $c{list_url} || !exists $c{log_file} || !exists $c{white_list} || !exists $c{black_list}) {
+        die "Invalid config file: missing required configuration keys";
+    }
+
+    @list_url   = @{ $c{list_url} };
+    $log_file   = $c{log_file};
+    $white_list = $c{white_list};
+    $black_list = $c{black_list};
 
     ensure_log_file_exists();
     ensure_list_files_exist();
@@ -100,7 +117,7 @@ sub init {
     print "  - $_\n" for @list_url;
     print "Log file: $log_file\n";
     print "Whitelist file: $white_list\n";
-    print "Blacklist file: $black_list\n";  
+    print "Blacklist file: $black_list\n";
 
     main();
 }
@@ -180,7 +197,17 @@ sub main {
 sub read_list_file {
     my ($path) = @_;
     open my $fh, '<', $path or die "Could not open $path: $!";
-    chomp(my @lines = <$fh>);
+    my @lines;
+    while (my $line = <$fh>) {
+        chomp $line;
+        $line =~ s/^\s+|\s+$//g;
+        next if $line eq '';
+        $line =~ s/^\s*#.*$//;    # skip full-line comments
+        $line =~ s/\s*#.*$//;     # strip inline comments
+        $line =~ s/^\s+|\s+$//g;
+        next if $line eq '';
+        push @lines, $line;
+    }
     return @lines;
 }
 
@@ -194,7 +221,15 @@ sub download_blocklists {
         die "Can not download $url: $response->{status} $response->{reason}\n"
             unless $response->{success};
 
-        push @entries, split /\R/, $response->{content};
+        for my $line (split /\R/, $response->{content}) {
+            $line =~ s/^\s+|\s+$//g;
+            next if $line eq '';
+            $line =~ s/^\s*#.*$//;    # skip commented lines
+            $line =~ s/\s*#.*$//;     # strip inline comments
+            $line =~ s/^\s+|\s+$//g;
+            next if $line eq '';
+            push @entries, $line;
+        }
         print "Downloaded blocklist from $url\n";
     }
 
@@ -208,6 +243,11 @@ sub collect_blocklist_entries {
     my @ipv6;
 
     for my $line (uniq(@$blacklist, @$blocklist)) {
+        next unless defined $line;
+        $line =~ s/^\s+|\s+$//g;
+        # skip empty or commented
+        next if $line eq '';
+
         if ($whitelist{$line}) {
             $stats{skipped}++;
             next;
@@ -231,11 +271,19 @@ sub collect_blocklist_entries {
 
 sub is_ipv4 {
     my ($value) = @_;
+    return 0 unless defined $value && length $value;
+    if ($value =~ m{^([^/]+)/(\d+)$}) {
+        $value = $1;
+    }
     return defined inet_pton(AF_INET, $value);
 }
 
 sub is_ipv6 {
     my ($value) = @_;
+    return 0 unless defined $value && length $value;
+    if ($value =~ m{^([^/]+)/(\d+)$}) {
+        $value = $1;
+    }
     return defined inet_pton(AF_INET6, $value);
 }
 

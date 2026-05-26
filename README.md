@@ -5,7 +5,7 @@ Use at your own risk :)
 Tested on Debian Bookworm.
 
 ## What it does ##
-This script automatically downloads blocklists from sources you can define in `blocklist.pl`.
+This script automatically downloads blocklists from sources you can define in `blocklist.conf` (simple key=value format).
 
 Then it will create nftables sets. One for IPv4 IPs and one for IPv6 IPs.
 
@@ -17,7 +17,10 @@ This can be overruled by a white and blacklist you can define in the correspondi
 
 Changes
 --------
-- V1.2.1: move configuration values to external `config.pl` and document external config usage
+- V1.2.1: move configuration values to external `blocklist.conf` and document external config usage
+
+> Upgrade note: if you are upgrading from an older release that used `config.pl`, migrate your configuration into `blocklist.conf` and place it either next to the script or in `/etc/blocklist/blocklist.conf`.
+
 - V1.2.0: modernize Perl implementation, remove wget/rm shell calls, and use safer nft execution
 - V1.1.8: @pingou2712: add option to block nat instead and add files and script for systemd
 - V1.1.7: @pingou2712: Update README.md in order to include systemd
@@ -71,19 +74,18 @@ Activating the -b flag, our IP blocking system addresses scenarios involving vir
 
 2. Download the ZIP, or Clone the repository, to a folder on your system.
 
-3. Open `config.pl` with your favorite text editor and set up your blocklist URLs, log file path, whitelist path, and blacklist path. The script now loads these values from this external config file instead of hardcoding them in `blocklist.pl`.
+3. Edit `blocklist.conf` with your favorite text editor and set up your blocklist URLs, log file path, whitelist path, and blacklist path. The script now loads these values from this external config file instead of executing Perl code.
 
-        our %CONFIG = (
-            list_url   => [
-                "http://lists.blocklist.de/lists/all.txt",
-                "https://www.spamhaus.org/drop/drop.txt",
-            ],
-            log_file   => "/var/log/blocklist",
-            white_list => "/etc/blocklist/whitelist",
-            black_list => "/etc/blocklist/blacklist",
-        );
+Example `blocklist.conf` (simple `key=value` format):
 
-        *You can add more URLs to the `list_url` array if you want to use additional blocklists.*
+    # blocklist.conf
+    list_url=http://lists.blocklist.de/lists/all.txt
+    list_url=https://www.spamhaus.org/drop/drop.txt
+    log_file=/var/log/blocklist
+    white_list=/etc/blocklist/whitelist
+    black_list=/etc/blocklist/blacklist
+
+    # You can repeat `list_url=` for multiple sources and add inline comments with `#`.
 
 4. Schedule the script execution using either a cron job or systemd (see below).
 
@@ -109,7 +111,7 @@ Activating the -b flag, our IP blocking system addresses scenarios involving vir
 		4.4.4.4
 	 	5.5.5.5
 
-That's it. If you want to manually run the script just cd to the folder where the script is located and run 
+That's it. If you want to manually run the script just cd to the folder where the script is located and run
 
 	./blocklist.pl
 
@@ -131,19 +133,28 @@ Create an cronjob. I have and hourly cronjob in /etc/crontab
 
 #### Automated Approach
 
-The script `/etc/blocklist/systemd/create_symlinks.sh` is designed to manage the creation or replacement of symbolic links for `blocklist.service` and `blocklist.timer` within the systemd system structure. 
+The helper script `create_symlinks.sh` creates or replaces the systemd symlinks:
 
-It checks for existing symbolic links in `/etc/systemd/system/` and offers the user an option to replace them if they already exist. This ensures that the systemd service and timer are correctly linked to their definitions in the `/etc/blocklist/systemd/` directory.
+- `/etc/systemd/system/blocklist.service`
+- `/etc/systemd/system/blocklist.timer`
 
-It's important to note that this script operates under the assumption that it resides within `/etc/blocklist/systemd/` and  that the systemd service is configured with the `-n` flag by default, aligning with the general use case.
+It points them to the files under `/etc/blocklist/systemd/` and prompts before replacing any existing symlink.
 
-To execute the script, simply navigate to its directory and run the following command in your terminal:
+If you installed the package via `make install`, make sure the systemd files are available under `/etc/blocklist/systemd/` before running the script. If you are running from the repository directly, you can copy the `systemd/` directory into `/etc/blocklist/` first.
+
+To execute the script, run:
 
 ```bash
 sudo /etc/blocklist/systemd/create_symlinks.sh
 ```
 
-Enable and start the timer:
+If the helper script is not installed in that location, use the repository version instead:
+
+```bash
+sudo ./systemd/create_symlinks.sh
+```
+
+Then reload systemd and enable the timer:
 
 ```bash
 sudo systemctl daemon-reload
@@ -163,7 +174,11 @@ Description=Run blocklist script
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/perl /path/to/the/script/blocklist.pl
+# If installed via `make install` (default):
+ExecStart=/sbin/blocklist.pl
+
+# Or if you run from repo/source location:
+# ExecStart=/usr/bin/perl /path/to/the/script/blocklist.pl
 ```
 
 In `blocklist.timer`:
