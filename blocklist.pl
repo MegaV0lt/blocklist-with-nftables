@@ -469,7 +469,7 @@ sub bigint_to_packed {
     return unless defined $bi;
     my $hex = $bi->as_hex(); # '0x...'
     $hex =~ s/^0x//i;
-    $hex = '0' . $hex unless length $hex % 2 == 0;
+    $hex = '0' . $hex unless length($hex) % 2 == 0;
     my $need = $len * 2;
     $hex = ('0' x ($need - length($hex))) . $hex if length($hex) < $need;
     return pack('H*', $hex);
