@@ -203,7 +203,7 @@ sub read_list_file {
         $line =~ s/^\s+|\s+$//g;
         next if $line eq '';
         next if $line =~ /^\s*[#;]/;   # skip full-line comments starting with # or ;
-        $line =~ s/\s*[#;].*$//;        # strip inline comments (# or ;)
+        $line =~ s/\s*[#;].*$//;       # strip inline comments (# or ;)
         $line =~ s/^\s+|\s+$//g;
         next if $line eq '';
         push @lines, $line;
@@ -238,35 +238,174 @@ sub download_blocklists {
 
 sub collect_blocklist_entries {
     my ($blocklist, $blacklist, $whitelist) = @_;
-    my %whitelist = map { $_ => 1 } @$whitelist;
-    my @ipv4;
-    my @ipv6;
+    # build whitelist structures for containment checks
+    my @wl = @$whitelist;
+    my (@wl4_singles, @wl4_cidrs, @wl6_singles, @wl6_cidrs);
+    for my $w (@wl) {
+        next unless defined $w;
+        $w =~ s/^\s+|\s+$//g;
+        next if $w eq '';
+        if ($w =~ /\//) {
+            if (is_ipv4($w)) { push @wl4_cidrs, $w } elsif (is_ipv6($w)) { push @wl6_cidrs, $w }
+        } else {
+            if (is_ipv4($w)) { push @wl4_singles, $w } elsif (is_ipv6($w)) { push @wl6_singles, $w }
+        }
+    }
+
+    my @raw4;
+    my @raw6;
 
     for my $line (uniq(@$blacklist, @$blocklist)) {
         next unless defined $line;
         $line =~ s/^\s+|\s+$//g;
-        # skip empty or commented
         next if $line eq '';
 
-        if ($whitelist{$line}) {
+        # skip exact whitelist matches quickly
+        if (grep { $_ eq $line } @wl4_singles, @wl6_singles) {
             $stats{skipped}++;
             next;
         }
 
         if (is_ipv4($line)) {
-            push @ipv4, $line;
-            $stats{added}++;
-            $stats{added_ipv4}++;
+            push @raw4, $line;
         } elsif (is_ipv6($line)) {
-            push @ipv6, $line;
-            $stats{added}++;
-            $stats{added_ipv6}++;
+            push @raw6, $line;
         } else {
             $stats{skipped}++;
         }
     }
 
+    # normalize: remove duplicates, remove single IPs contained in CIDRs,
+    # and remove CIDRs that are fully contained in other CIDRs or that would
+    # block whitelist single IPs.
+    my @ipv4 = normalize_entries(\@raw4, \@wl4_singles, \@wl4_cidrs, 4);
+    my @ipv6 = normalize_entries(\@raw6, \@wl6_singles, \@wl6_cidrs, 6);
+
+    $stats{added_ipv4} = scalar @ipv4;
+    $stats{added_ipv6} = scalar @ipv6;
+    $stats{added} = $stats{added_ipv4} + $stats{added_ipv6};
+
     return (\@ipv4, \@ipv6);
+}
+
+sub normalize_entries {
+    my ($entries_ref, $wl_singles_ref, $wl_cidrs_ref, $family) = @_;
+    my @entries = @$entries_ref;
+    my %seen;
+    my @singles;
+    my @cidrs;
+
+    # separate singles and cidrs, dedupe exact strings
+    for my $e (@entries) {
+        next unless defined $e;
+        $e =~ s/^\s+|\s+$//g;
+        next if $e eq '';
+        next if $seen{$e}++;
+        if ($e =~ /\//) { push @cidrs, $e } else { push @singles, $e }
+    }
+
+    # parse cidrs into ranges (packed start/end)
+    my @cidr_structs;
+    for my $c (@cidrs) {
+        my ($start, $end) = cidr_to_range($c);
+        next unless defined $start;
+        push @cidr_structs, { cidr => $c, start => $start, end => $end };
+    }
+
+    # remove cidrs that would block any whitelist single
+    for my $c (@cidr_structs) {
+        my $skip = 0;
+        for my $w (@$wl_singles_ref) {
+            my $wp = pack_ip($w);
+            next unless defined $wp;
+            if (ip_in_range($wp, $c->{start}, $c->{end})) { $skip = 1; last }
+        }
+        $c->{skip} = 1 if $skip;
+    }
+
+    # remove cidrs fully contained in another cidr
+    for my $i (0..$#cidr_structs) {
+        next if $cidr_structs[$i]{skip};
+        for my $j (0..$#cidr_structs) {
+            next if $i == $j;
+            next if $cidr_structs[$j]{skip};
+            if (cidr_contains($cidr_structs[$j], $cidr_structs[$i])) {
+                $cidr_structs[$i]{skip} = 1;
+                last;
+            }
+        }
+    }
+
+    # prepare final cidr list
+    my @final_cidrs = map { $_->{cidr} } grep { !$_->{skip} } @cidr_structs;
+
+    # remove singles that fall into any remaining cidr
+    my @final_singles;
+    for my $s (@singles) {
+        my $sp = pack_ip($s);
+        next unless defined $sp;
+        my $in = 0;
+        for my $c (@cidr_structs) {
+            next if $c->{skip};
+            if (ip_in_range($sp, $c->{start}, $c->{end})) { $in = 1; last }
+        }
+        push @final_singles, $s unless $in;
+    }
+
+    # dedupe and return: put cidrs first, then singles
+    return (@final_cidrs, @final_singles);
+}
+
+sub pack_ip {
+    my ($ip) = @_;
+    return undef unless defined $ip && length $ip;
+    my $p = inet_pton(AF_INET, $ip);
+    return $p if defined $p;
+    return inet_pton(AF_INET6, $ip);
+}
+
+sub cidr_to_range {
+    my ($cidr) = @_;
+    return unless $cidr =~ m{^([^/]+)/(\d+)$};
+    my ($ip, $prefix) = ($1, $2);
+    my $p = pack_ip($ip);
+    return unless defined $p;
+    my $len = length $p;    # 4 or 16
+
+    # build mask bytes
+    my @mask;
+    my $bits = $prefix;
+    for my $i (1..$len) {
+        if ($bits >= 8) { push @mask, 0xFF; $bits -= 8 }
+        elsif ($bits <= 0) { push @mask, 0x00 }
+        else { push @mask, ((0xFF << (8 - $bits)) & 0xFF); $bits = 0 }
+    }
+
+    # compute network base (start) and end
+    my $start = '';
+    my $end = '';
+    for my $i (0..$len-1) {
+        my $b = ord(substr($p, $i, 1));
+        my $m = $mask[$i];
+        my $nb = $b & $m;
+        my $eb = $nb | (~$m & 0xFF);
+        $start .= chr($nb);
+        $end   .= chr($eb);
+    }
+
+    return ($start, $end);
+}
+
+sub ip_in_range {
+    my ($ip_packed, $start, $end) = @_;
+    return 0 unless defined $ip_packed && defined $start && defined $end;
+    return ($ip_packed ge $start && $ip_packed le $end) ? 1 : 0;
+}
+
+sub cidr_contains {
+    my ($outer, $inner) = @_; # both are {start =>..., end=>...}
+    return 0 unless defined $outer && defined $inner;
+    return ($inner->{start} ge $outer->{start} && $inner->{end} le $outer->{end}) ? 1 : 0;
 }
 
 sub is_ipv4 {
