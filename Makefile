@@ -1,5 +1,5 @@
 NAME=blocklist
-VERSION=1.2.0
+VERSION=1.2.1
 
 SBIN_FILES=blocklist.pl
 ETC_FILES=blacklist whitelist
