@@ -292,8 +292,7 @@ sub normalize_entries {
     my ($entries_ref, $wl_singles_ref, $wl_cidrs_ref, $family) = @_;
     my @entries = @$entries_ref;
     my %seen;
-    my @singles;
-    my @cidrs;
+    my (@singles, @cidrs);
 
     # separate singles and cidrs, dedupe exact strings
     for my $e (@entries) {
@@ -304,7 +303,11 @@ sub normalize_entries {
         if ($e =~ /\//) { push @cidrs, $e } else { push @singles, $e }
     }
 
-    # parse cidrs into ranges (packed start/end)
+    # memoize packed IPs for whitelist singles and input singles
+    my %pack_cache;
+    my @wl_packed = sort { $a cmp $b } grep { defined } map { $pack_cache{$_} //= pack_ip($_) } grep { defined && length } @$wl_singles_ref;
+
+    # build cidr structs with packed ranges
     my @cidr_structs;
     for my $c (@cidrs) {
         my ($start, $end) = cidr_to_range($c);
@@ -312,47 +315,65 @@ sub normalize_entries {
         push @cidr_structs, { cidr => $c, start => $start, end => $end };
     }
 
-    # remove cidrs that would block any whitelist single
+    # sort cidrs by start to allow linear scan for containment and overlap
+    @cidr_structs = sort { $a->{start} cmp $b->{start} } @cidr_structs;
+
+    # remove cidrs that would block any whitelist single using binary search
     for my $c (@cidr_structs) {
-        my $skip = 0;
-        for my $w (@$wl_singles_ref) {
-            my $wp = pack_ip($w);
-            next unless defined $wp;
-            if (ip_in_range($wp, $c->{start}, $c->{end})) { $skip = 1; last }
+        next unless @wl_packed;
+        my $idx = lower_bound_pack(
+            \@wl_packed,
+            $c->{start}
+        );
+        # check found index and previous one
+        for my $j ($idx-1, $idx) {
+            next if $j < 0 || $j > $#{\@wl_packed};
+            if (ip_in_range($wl_packed[$j], $c->{start}, $c->{end})) { $c->{skip} = 1; last }
         }
-        $c->{skip} = 1 if $skip;
     }
 
-    # remove cidrs fully contained in another cidr
-    for my $i (0..$#cidr_structs) {
-        next if $cidr_structs[$i]{skip};
-        for my $j (0..$#cidr_structs) {
-            next if $i == $j;
-            next if $cidr_structs[$j]{skip};
-            if (cidr_contains($cidr_structs[$j], $cidr_structs[$i])) {
-                $cidr_structs[$i]{skip} = 1;
-                last;
+    # linear sweep to remove cidrs contained in previous (non-skipped) cidr
+    my @kept;
+    for my $c (@cidr_structs) {
+        next if $c->{skip};
+        if (@kept) {
+            my $last = $kept[-1];
+            # if current is fully contained in last, skip it
+            if ($c->{start} ge $last->{start} && $c->{end} le $last->{end}) {
+                next;
+            }
+            # if overlaps partially, expand last end to cover both to avoid conflicts
+            if ($c->{start} le $last->{end}) {
+                $last->{end} = $c->{end} if $c->{end} gt $last->{end};
+                # we also mark current as merged so we won't output it
+                $c->{skip} = 1;
+                next;
             }
         }
+        push @kept, $c;
     }
 
-    # prepare final cidr list
+    # produce final cidr list: keep original cidr strings for non-skipped entries
     my @final_cidrs = map { $_->{cidr} } grep { !$_->{skip} } @cidr_structs;
 
-    # remove singles that fall into any remaining cidr
+    # prepare sorted kept ranges for single lookup
+    my @kept_ranges = map { { start => $_->{start}, end => $_->{end} } } grep { !$_->{skip} } @cidr_structs;
+
+    # remove singles that fall into any remaining cidr using binary search
     my @final_singles;
     for my $s (@singles) {
-        my $sp = pack_ip($s);
+        my $sp = $pack_cache{$s} //= pack_ip($s);
         next unless defined $sp;
         my $in = 0;
-        for my $c (@cidr_structs) {
-            next if $c->{skip};
-            if (ip_in_range($sp, $c->{start}, $c->{end})) { $in = 1; last }
+        # binary search on kept_ranges by start
+        my $idx = lower_bound_ranges(\@kept_ranges, $sp);
+        for my $j ($idx-1, $idx) {
+            next if $j < 0 || $j > $#{\@kept_ranges};
+            if (ip_in_range($sp, $kept_ranges[$j]{start}, $kept_ranges[$j]{end})) { $in = 1; last }
         }
         push @final_singles, $s unless $in;
     }
 
-    # dedupe and return: put cidrs first, then singles
     return (@final_cidrs, @final_singles);
 }
 
@@ -406,6 +427,30 @@ sub cidr_contains {
     my ($outer, $inner) = @_; # both are {start =>..., end=>...}
     return 0 unless defined $outer && defined $inner;
     return ($inner->{start} ge $outer->{start} && $inner->{end} le $outer->{end}) ? 1 : 0;
+}
+
+# lower_bound for packed strings array: first index with value >= target
+sub lower_bound_pack {
+    my ($arr_ref, $target) = @_;
+    my $lo = 0;
+    my $hi = scalar(@$arr_ref);
+    while ($lo < $hi) {
+        my $mid = int(($lo + $hi) / 2);
+        if ($arr_ref->[$mid] lt $target) { $lo = $mid + 1 } else { $hi = $mid }
+    }
+    return $lo;
+}
+
+# lower_bound for ranges array (each element {start=>..., end=>...}), compare by start
+sub lower_bound_ranges {
+    my ($arr_ref, $target) = @_;
+    my $lo = 0;
+    my $hi = scalar(@$arr_ref);
+    while ($lo < $hi) {
+        my $mid = int(($lo + $hi) / 2);
+        if ($arr_ref->[$mid]{start} lt $target) { $lo = $mid + 1 } else { $hi = $mid }
+    }
+    return $lo;
 }
 
 sub is_ipv4 {
