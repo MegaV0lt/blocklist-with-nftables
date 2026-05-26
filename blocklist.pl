@@ -478,10 +478,34 @@ sub bigint_to_packed {
 sub range_to_cidrs {
     my ($start_packed, $end_packed) = @_;
     my $len = length $start_packed;
+    my @cidrs;
+
+    if ($len == 4) {
+        # IPv4: use native integers for speed and correctness
+        my $s = unpack('N', $start_packed);
+        my $e = unpack('N', $end_packed);
+        while ($s <= $e) {
+            # largest block aligned at s
+            my $tmp = $s;
+            my $tz = 0;
+            while (($tmp & 1) == 0 && $tz < 32) { $tmp >>= 1; $tz++; }
+            my $max_block = 1 << $tz;
+            # reduce block if it exceeds range
+            while ($s + $max_block - 1 > $e) {
+                $max_block >>= 1;
+            }
+            my $prefix = 32 - (int(log($max_block)/log(2)));
+            my $ip_text = sprintf('%d.%d.%d.%d', ($s>>24)&0xFF, ($s>>16)&0xFF, ($s>>8)&0xFF, $s&0xFF);
+            push @cidrs, "$ip_text/$prefix";
+            $s += $max_block;
+        }
+        return @cidrs;
+    }
+
+    # IPv6: BigInt path
     my $maxbits = $len * 8;
     my $start_bi = packed_to_bigint($start_packed);
     my $end_bi = packed_to_bigint($end_packed);
-    my @cidrs;
 
     while ($start_bi <= $end_bi) {
         # find largest block aligned at start
@@ -490,7 +514,7 @@ sub range_to_cidrs {
             my $block = Math::BigInt->new(2)->bpow($maxbits - $pref);
             # alignment check: start_bi % block == 0
             my $mod = $start_bi->copy()->bmod($block);
-            last if $mod != 0;
+            last if $mod->is_pos();
             $max_pref = $pref;
         }
         # adjust prefix so block does not exceed end
@@ -503,7 +527,7 @@ sub range_to_cidrs {
 
         # produce cidr for start_bi with prefix max_pref
         my $packed = bigint_to_packed($start_bi, $len);
-        my $ip_text = inet_ntop($len == 4 ? AF_INET : AF_INET6, $packed);
+        my $ip_text = inet_ntop(AF_INET6, $packed);
         push @cidrs, "$ip_text/$max_pref";
 
         # advance start_bi by block size
