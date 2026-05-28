@@ -209,6 +209,13 @@ sub read_list_file {
         next if $line eq '';
         push @lines, $line;
     }
+    #! debug print the number of entries read and ips for verification
+    logging("Read " . scalar(@lines) . " entries from $path");
+    logging("Sample entries from $path:");
+    for my $sample (@lines[0..($#lines < 10 ? $#lines : 9)]) {
+        logging("  $sample");
+    }
+    close $fh or die "Could not close $path: $!";
     return @lines;
 }
 
@@ -253,6 +260,9 @@ sub collect_blocklist_entries {
         }
     }
 
+    my @wl4_cidr_structs = map { my ($s,$e)=cidr_to_range($_); { start => $s, end => $e } } @wl4_cidrs;
+    my @wl6_cidr_structs = map { my ($s,$e)=cidr_to_range($_); { start => $s, end => $e } } @wl6_cidrs;
+
     my @raw4;
     my @raw6;
 
@@ -268,8 +278,18 @@ sub collect_blocklist_entries {
         }
 
         if (is_ipv4($line)) {
+            my $packed = pack_ip($line);
+            if (ip_in_any_ranges($packed, @wl4_cidr_structs)) {
+                $stats{skipped}++;
+                next;
+            }
             push @raw4, $line;
         } elsif (is_ipv6($line)) {
+            my $packed = pack_ip($line);
+            if (ip_in_any_ranges($packed, @wl6_cidr_structs)) {
+                $stats{skipped}++;
+                next;
+            }
             push @raw6, $line;
         } else {
             $stats{skipped}++;
@@ -285,6 +305,17 @@ sub collect_blocklist_entries {
     $stats{added_ipv4} = scalar @ipv4;
     $stats{added_ipv6} = scalar @ipv6;
     $stats{added} = $stats{added_ipv4} + $stats{added_ipv6};
+
+    #! Debug: Save list to temporary files for verification
+    my ($fh4, $tmp4) = tempfile(SUFFIX => '_ipv4.txt');
+    print {$fh4} join("\n", @ipv4);
+    close $fh4;
+    logging("Normalized IPv4 blocklist entries saved to $tmp4 for verification");
+
+    my ($fh6, $tmp6) = tempfile(SUFFIX => '_ipv6.txt');
+    print {$fh6} join("\n", @ipv6);
+    close $fh6;
+    logging("Normalized IPv6 blocklist entries saved to $tmp6 for verification");
 
     return (\@ipv4, \@ipv6);
 }
@@ -319,18 +350,24 @@ sub normalize_entries {
     # sort cidrs by start to allow linear scan for containment and overlap
     @cidr_structs = sort { $a->{start} cmp $b->{start} } @cidr_structs;
 
-    # remove cidrs that would block any whitelist single using binary search
+    # remove cidrs that would block any whitelist single or whitelist cidr using binary search
     for my $c (@cidr_structs) {
-        next unless @wl_packed;
-        my $idx = lower_bound_pack(
-            \@wl_packed,
-            $c->{start}
-        );
-        # check found index and previous one
-        for my $j ($idx-1, $idx) {
-            next if $j < 0 || $j > $#{\@wl_packed};
-            if (ip_in_range($wl_packed[$j], $c->{start}, $c->{end})) { $c->{skip} = 1; last }
+        next unless @wl_packed || @{$wl_cidrs_ref};
+        my $skip = 0;
+        if (@wl_packed) {
+            my $idx = lower_bound_pack(\@wl_packed, $c->{start});
+            for my $j ($idx-1, $idx) {
+                next if $j < 0 || $j > $#{\@wl_packed};
+                if (ip_in_range($wl_packed[$j], $c->{start}, $c->{end})) { $skip = 1; last }
+            }
         }
+        if (!$skip && @{$wl_cidrs_ref}) {
+            my @wl_ranges = map { my ($s,$e)=cidr_to_range($_); { start => $s, end => $e } } @{$wl_cidrs_ref};
+            if (range_overlaps_any($c->{start}, $c->{end}, @wl_ranges)) {
+                $skip = 1;
+            }
+        }
+        $c->{skip} = 1 if $skip;
     }
 
     # linear sweep to remove cidrs contained in previous (non-skipped) cidr
@@ -425,6 +462,26 @@ sub ip_in_range {
     my ($ip_packed, $start, $end) = @_;
     return 0 unless defined $ip_packed && defined $start && defined $end;
     return ($ip_packed ge $start && $ip_packed le $end) ? 1 : 0;
+}
+
+sub ip_in_any_ranges {
+    my ($ip_packed, @ranges) = @_;
+    return 0 unless defined $ip_packed;
+    for my $range (@ranges) {
+        next unless defined $range->{start} && defined $range->{end};
+        return 1 if ip_in_range($ip_packed, $range->{start}, $range->{end});
+    }
+    return 0;
+}
+
+sub range_overlaps_any {
+    my ($start, $end, @ranges) = @_;
+    return 0 unless defined $start && defined $end;
+    for my $range (@ranges) {
+        next unless defined $range->{start} && defined $range->{end};
+        return 1 if !($end lt $range->{start} || $range->{end} lt $start);
+    }
+    return 0;
 }
 
 sub cidr_contains {
