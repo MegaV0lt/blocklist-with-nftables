@@ -118,7 +118,7 @@ sub init {
     print "  - $_\n" for @list_url;
     print "Log file: $log_file\n";
     print "Whitelist file: $white_list\n";
-    print "Blacklist file: $black_list\n";
+    print "Blacklist file: $black_list\n\n";
 
     main();
 }
@@ -209,12 +209,8 @@ sub read_list_file {
         next if $line eq '';
         push @lines, $line;
     }
-    #! debug print the number of entries read and ips for verification
+    # print the number of entries read for verification
     logging("Read " . scalar(@lines) . " entries from $path");
-    logging("Sample entries from $path:");
-    for my $sample (@lines[0..($#lines < 10 ? $#lines : 9)]) {
-        logging("  $sample");
-    }
     close $fh or die "Could not close $path: $!";
     return @lines;
 }
@@ -233,12 +229,12 @@ sub download_blocklists {
             $line =~ s/^\s+|\s+$//g;
             next if $line eq '';
             next if $line =~ /^\s*[#;]/;   # skip commented lines starting with # or ;
-            $line =~ s/\s*[#;].*$//;        # strip inline comments (# or ;)
+            $line =~ s/\s*[#;].*$//;       # strip inline comments (# or ;)
             $line =~ s/^\s+|\s+$//g;
             next if $line eq '';
             push @entries, $line;
         }
-        print "Downloaded blocklist from $url\n";
+        logging("Downloaded blocklist from $url");
     }
 
     return @entries;
@@ -305,17 +301,6 @@ sub collect_blocklist_entries {
     $stats{added_ipv4} = scalar @ipv4;
     $stats{added_ipv6} = scalar @ipv6;
     $stats{added} = $stats{added_ipv4} + $stats{added_ipv6};
-
-    #! Debug: Save list to temporary files for verification
-    my ($fh4, $tmp4) = tempfile(SUFFIX => '_ipv4.txt');
-    print {$fh4} join("\n", @ipv4);
-    close $fh4;
-    logging("Normalized IPv4 blocklist entries saved to $tmp4 for verification");
-
-    my ($fh6, $tmp6) = tempfile(SUFFIX => '_ipv6.txt');
-    print {$fh6} join("\n", @ipv6);
-    close $fh6;
-    logging("Normalized IPv6 blocklist entries saved to $tmp6 for verification");
 
     return (\@ipv4, \@ipv6);
 }
